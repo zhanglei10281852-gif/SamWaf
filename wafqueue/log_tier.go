@@ -37,12 +37,34 @@ const (
 // 同一 req_uuid 一批里可能出现两次（分阶段入队），三张表都以它为主键，批内去重取后到的那条，
 // 跨批次由主键 DoNothing 兜住。
 func tierForStore(logs []*innerbean.WebLog) (events []*model.SecurityEvent, accesses []*model.AccessLog, payloads []*model.EventPayload) {
+	_, events, accesses, payloads = classifyForTier(logs)
+	return events, accesses, payloads
+}
+
+// logTierDecision 一条日志在「接收批次」那一刻冻结下来的分层决策。
+// 台账重试/重启恢复必须按这份决策补齐缺失层，而不能重新判定：
+//   - 重新进蓄水池 Pick 会把 seen 计数加大，破坏等概率采样语义（重启后池子是空的，
+//     早期请求会被超额采中）；
+//   - 观察名单、档位都可能在故障期间变化，恢复时按新状态分流会让同批次落层不一致；
+//   - SkipPayloadStore 是运行期标记（json:"-"），不落进批次报文，只能靠决策位留痕。
+type logTierDecision struct {
+	Event        bool `json:"e"`  // IsSecurityEvent：进 security_event
+	Watch        bool `json:"w"`  // 观察名单内 IP 的正常请求：窄行 + kind=watch 报文
+	Sampled      bool `json:"s"`  // 被负样本蓄水池采中（sample 档下写窄行）
+	EventPayload bool `json:"ep"` // 应存在 kind=event 报文行（非 SkipPayloadStore 且报文非全空）
+	WatchPayload bool `json:"wp"` // 应存在 kind=watch 报文行（报文非全空）
+}
+
+// classifyForStore 在批次被台账接收时调用一次：补齐 req_uuid、询问蓄水池、冻结每条日志的分层决策，
+// 并产出本批应写入三层的行。返回的决策与日志切片下标一一对应（nil 条目也占位，重建时按同序对齐）。
+func classifyForTier(logs []*innerbean.WebLog) (decisions []logTierDecision, events []*model.SecurityEvent, accesses []*model.AccessLog, payloads []*model.EventPayload) {
 	mode := global.GDATA_ACCESS_LOG_MODE
+	decisions = make([]logTierDecision, len(logs))
 	seenEvent := make(map[string]int, len(logs))
 	seenAccess := make(map[string]int, len(logs))
 	seenPayload := make(map[string]int, len(logs))
 
-	for _, lg := range logs {
+	for i, lg := range logs {
 		if lg == nil {
 			continue
 		}
@@ -52,6 +74,7 @@ func tierForStore(logs []*innerbean.WebLog) (events []*model.SecurityEvent, acce
 			lg.REQ_UUID = uuid.GenUUID()
 		}
 
+		d := logTierDecision{}
 		isEvent := lg.IsSecurityEvent()
 		// 观察名单（C7）：名单内 IP 的正常请求也全量留痕——窄行必写、报文 kind=watch。
 		// 已按安全事件处理的不再重复取报文（event_payload 以 req_uuid 为主键，一条只有一行）。
@@ -64,6 +87,9 @@ func tierForStore(logs []*innerbean.WebLog) (events []*model.SecurityEvent, acce
 			// 观察名单内的已由 watch 全量留痕，不重复采样。
 			sampled = negSampler.Pick(lg)
 		}
+		d.Event = isEvent
+		d.Watch = watched
+		d.Sampled = sampled
 
 		ln := narrowFromLog(lg)
 
@@ -73,15 +99,52 @@ func tierForStore(logs []*innerbean.WebLog) (events []*model.SecurityEvent, acce
 			if !lg.SkipPayloadStore {
 				if p := extractPayload(lg, PayloadKindEvent); p != nil {
 					payloads = dedupByUUID(payloads, seenPayload, p.ReqUUID, p)
+					d.EventPayload = true
 				}
 			}
 		}
 		if watched {
 			if p := extractPayload(lg, PayloadKindWatch); p != nil {
 				payloads = dedupByUUID(payloads, seenPayload, p.ReqUUID, p)
+				d.WatchPayload = true
 			}
 		}
 		if isEvent || watched || mode == "db" || (mode == "sample" && sampled) {
+			accesses = dedupByUUID(accesses, seenAccess, lg.REQ_UUID, &model.AccessLog{LogNarrow: ln})
+		}
+		decisions[i] = d
+	}
+	return decisions, events, accesses, payloads
+}
+
+// rebuildTierRows 台账重试/重启恢复时按冻结决策重建三层行：不重新询问蓄水池、不重新判定观察名单，
+// 档位以批次接收时冻结在信封里的 mode 为准。窄行/报文仍从原始日志拷贝（截断、分析键的规则不变），
+// 批内按 req_uuid 去重，跨批次靠主键 DoNothing——已存在的行只跳过不复制。
+func rebuildTierRows(logs []*innerbean.WebLog, decisions []logTierDecision, mode string) (events []*model.SecurityEvent, accesses []*model.AccessLog, payloads []*model.EventPayload) {
+	seenEvent := make(map[string]int, len(logs))
+	seenAccess := make(map[string]int, len(logs))
+	seenPayload := make(map[string]int, len(logs))
+	for i, lg := range logs {
+		if lg == nil || i >= len(decisions) {
+			continue
+		}
+		d := decisions[i]
+		ln := narrowFromLog(lg)
+		if d.Event {
+			events = dedupByUUID(events, seenEvent, lg.REQ_UUID,
+				&model.SecurityEvent{LogNarrow: ln, PayloadHash: PayloadHash(lg.RULE, lg.BodyHash)})
+		}
+		if d.EventPayload {
+			if p := extractPayload(lg, PayloadKindEvent); p != nil {
+				payloads = dedupByUUID(payloads, seenPayload, p.ReqUUID, p)
+			}
+		}
+		if d.WatchPayload {
+			if p := extractPayload(lg, PayloadKindWatch); p != nil {
+				payloads = dedupByUUID(payloads, seenPayload, p.ReqUUID, p)
+			}
+		}
+		if d.Event || d.Watch || mode == "db" || (mode == "sample" && d.Sampled) {
 			accesses = dedupByUUID(accesses, seenAccess, lg.REQ_UUID, &model.AccessLog{LogNarrow: ln})
 		}
 	}

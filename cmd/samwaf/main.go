@@ -1009,8 +1009,14 @@ func (m *wafSystenService) stopSamWaf() {
 	zlog.Info("Shutdown SamWaf Queue Processors...")
 	// 关闭信号通道，通知所有队列处理协程退出
 	close(global.GWAF_QUEUE_SHUTDOWN_SIGNAL)
-	// 等待一段时间，让队列处理协程有时间完成当前工作并退出
-	time.Sleep(500 * time.Millisecond)
+	// 日志消费协程先停生产（上方引擎已关闭）再排空并等待已接收批次确认收敛；
+	// 超时未确认的批次留在本地台账，下次启动继续。其余队列协程随后给一点收尾时间。
+	if wafqueue.WaitLogQueueDrain() {
+		zlog.Info("Shutdown SamWaf Log Queue drain finished")
+	} else {
+		zlog.Warn("Shutdown SamWaf Log Queue drain timeout, unacknowledged batches will resume on next start")
+	}
+	time.Sleep(200 * time.Millisecond)
 	zlog.Info("Shutdown SamWaf Queue Processors finished")
 
 	// 设置任务停止标志

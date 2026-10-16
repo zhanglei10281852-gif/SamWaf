@@ -12,6 +12,8 @@ import (
 func InitDequeEngine() {
 	// 重置关闭信号通道
 	global.GWAF_QUEUE_SHUTDOWN_SIGNAL = make(chan struct{})
+	// 重置日志消费协程的关停排空生命周期
+	resetLogProcessorLifecycle()
 	global.GQEQUE_DB = queue.NewQueue()
 	global.GQEQUE_UPDATE_DB = queue.NewQueue()
 	global.GQEQUE_LOG_DB = queue.NewQueue()
